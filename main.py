@@ -1,26 +1,15 @@
 """
 REDFORT API — backend de stress test real
-FastAPI + hey (HTTP load generator)
-Deploy: Render.com Web Service
+FastAPI + curl paralelo (sem dependência externa)
 """
-
-import asyncio
-import json
-import os
-import re
-import shutil
-import subprocess
-import tempfile
+import asyncio, json, os, shutil, subprocess, time
 from typing import AsyncGenerator
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
-app = FastAPI(title="REDFORT API", version="1.0.0")
-
-# CORS aberto — painel roda em domínio diferente
+app = FastAPI(title="REDFORT API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,184 +17,164 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class FloodRequest(BaseModel):
     target: str
-    users: int = 50        # concorrência (-c)
-    requests: int = 5000   # total de requisições (-n)
-    duration: int = 30     # duração em segundos (-z)
+    users: int = 50
+    duration: int = 30
     method: str = "GET"
 
+def sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
 
-def _hey_path() -> str:
-    """Localiza hey no PATH ou em /tmp/hey."""
-    p = shutil.which("hey")
-    if p:
-        return p
-    local = "/tmp/hey"
-    if os.path.isfile(local) and os.access(local, os.X_OK):
-        return local
-    return ""
-
-
-def _install_hey() -> bool:
-    """Baixa hey para /tmp se não estiver disponível."""
-    import urllib.request, stat
-    url = "https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64"
-    dest = "/tmp/hey"
-    try:
-        urllib.request.urlretrieve(url, dest)
-        os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        return True
-    except Exception:
-        return False
-
-
-def _parse_hey_output(raw: str) -> dict:
-    """Extrai métricas do output do hey."""
-    metrics = {}
-    patterns = {
-        "total_requests": r"(\d+) requests in",
-        "rps":            r"Requests/sec:\s+([\d.]+)",
-        "avg_ms":         r"Average:\s+([\d.]+) secs",
-        "p50_ms":         r"50% in ([\d.]+) secs",
-        "p90_ms":         r"90% in ([\d.]+) secs",
-        "p99_ms":         r"99% in ([\d.]+) secs",
-        "fastest_ms":     r"Fastest:\s+([\d.]+) secs",
-        "slowest_ms":     r"Slowest:\s+([\d.]+) secs",
-        "total_data":     r"Total data:\s+(.+)",
-        "size_req":       r"Size/request:\s+(.+)",
-    }
-    for key, pat in patterns.items():
-        m = re.search(pat, raw)
-        if m:
-            val = m.group(1)
-            # converter secs → ms para latências
-            if key.endswith("_ms") and key != "total_data":
-                try:
-                    val = round(float(val) * 1000, 1)
-                except ValueError:
-                    pass
-            metrics[key] = val
-
-    # status codes
-    status_block = re.search(r"\[(\d+)\]\s+(\d+) responses", raw)
-    if status_block:
-        metrics["status_2xx"] = status_block.group(2)
-
-    # erros
-    err_m = re.search(r"Error distribution:(.*?)$", raw, re.DOTALL)
-    if err_m:
-        metrics["errors"] = err_m.group(1).strip()[:200]
-
-    return metrics
-
+def _normalize_target(target: str) -> str:
+    t = target.strip()
+    if not t.startswith("http://") and not t.startswith("https://"):
+        t = "https://" + t
+    return t
 
 async def _stream_flood(req: FloodRequest) -> AsyncGenerator[str, None]:
-    """Executa hey e faz streaming do resultado via SSE."""
-
-    def sse(data: dict) -> str:
-        return f"data: {json.dumps(data)}\n\n"
-
-    # garantir hey disponível
-    hey = _hey_path()
-    if not hey:
-        yield sse({"type": "log", "msg": "[*] hey não encontrado — instalando...", "level": "info"})
-        ok = await asyncio.get_event_loop().run_in_executor(None, _install_hey)
-        if not ok:
-            yield sse({"type": "error", "msg": "[!] falha ao instalar hey — verifique conectividade do Render"})
-            return
-        hey = "/tmp/hey"
-        yield sse({"type": "log", "msg": "[+] hey instalado com sucesso", "level": "success"})
-
-    # validar target
-    target = req.target
-    if not target.startswith("http"):
-        target = "https://" + target
-
-    users = max(1, min(req.users, 500))
+    target = _normalize_target(req.target)
+    users = max(1, min(req.users, 200))
     duration = max(5, min(req.duration, 120))
+    method = req.method.upper() if req.method.upper() in ("GET", "POST", "HEAD") else "GET"
 
-    cmd = [
-        hey,
-        "-c", str(users),          # concorrência
-        "-z", f"{duration}s",       # duração
-        "-m", req.method,
-        "-disable-keepalive",       # força novas conexões TCP
-        "-H", "User-Agent: RedfortProbe/1.0",
-        target
-    ]
+    yield sse({"type": "log", "msg": f"[*] alvo: {target}"})
+    yield sse({"type": "log", "msg": f"[*] conexões: {users} · duração: {duration}s · método: {method}"})
 
-    yield sse({"type": "log", "msg": f"[*] iniciando flood real: {users} conn · {duration}s · {target}", "level": "info"})
-    yield sse({"type": "log", "msg": f"[*] cmd: {' '.join(cmd)}", "level": "muted"})
-
-    # progresso fake enquanto hey roda (hey não tem output em tempo real)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    # tick de progresso a cada 3s enquanto espera
-    tick = 0
-    while proc.returncode is None:
-        await asyncio.sleep(3)
-        tick += 3
-        if tick <= duration:
-            yield sse({"type": "progress", "elapsed": tick, "total": duration,
-                       "msg": f"[~] rodando... {tick}/{duration}s", "level": "muted"})
-
-    stdout, stderr = await proc.communicate()
-    raw = stdout.decode("utf-8", errors="replace")
-    err = stderr.decode("utf-8", errors="replace")
-
-    if proc.returncode != 0 and not raw:
-        yield sse({"type": "error", "msg": f"[!] hey falhou: {err[:300]}"})
+    # verifica curl
+    curl_path = shutil.which("curl")
+    if not curl_path:
+        yield sse({"type": "error", "msg": "[!] curl não encontrado no servidor"})
         return
 
-    # parsear e emitir métricas
-    metrics = _parse_hey_output(raw)
-    yield sse({"type": "log", "msg": f"[*] concluído — {metrics.get('total_requests','?')} req · {metrics.get('rps','?')} req/s", "level": "success"})
-    yield sse({"type": "log", "msg": f"[*] avg={metrics.get('avg_ms','?')}ms p50={metrics.get('p50_ms','?')}ms p99={metrics.get('p99_ms','?')}ms", "level": "info"})
-    yield sse({"type": "log", "msg": f"[*] fastest={metrics.get('fastest_ms','?')}ms slowest={metrics.get('slowest_ms','?')}ms", "level": "info"})
+    yield sse({"type": "log", "msg": f"[+] usando curl ({curl_path}) — flood server-side real"})
+    yield sse({"type": "log", "msg": "[*] iniciando flood..."})
 
-    if metrics.get("errors"):
-        yield sse({"type": "log", "msg": f"[!] erros: {metrics['errors']}", "level": "warning"})
+    start = time.time()
+    total_requests = 0
+    total_errors = 0
+    latencies = []
 
-    # calcular crash prob real baseada em p99
-    p99 = metrics.get("p99_ms", 0)
-    try:
-        p99 = float(p99)
-        if p99 < 500:       crash_prob = 5
-        elif p99 < 1000:    crash_prob = 25
-        elif p99 < 2000:    crash_prob = 55
-        elif p99 < 5000:    crash_prob = 80
-        else:               crash_prob = 95
-    except (TypeError, ValueError):
-        crash_prob = 0
+    # semáforo pra controlar concorrência
+    sem = asyncio.Semaphore(users)
 
-    yield sse({"type": "result", "metrics": metrics, "crash_prob": crash_prob, "raw": raw[:2000]})
+    async def one_request():
+        nonlocal total_requests, total_errors
+        async with sem:
+            t0 = time.time()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    curl_path,
+                    "-s", "-o", "/dev/null", "-w", "%{http_code}:%{time_total}",
+                    "-X", method,
+                    "--max-time", "10",
+                    "--connect-timeout", "5",
+                    "--no-keepalive",
+                    target,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=12)
+                out = stdout.decode().strip()
+                if ":" in out:
+                    code, t_str = out.split(":", 1)
+                    lat = float(t_str) * 1000
+                    latencies.append(lat)
+                    if int(code) >= 500:
+                        total_errors += 1
+                total_requests += 1
+            except Exception:
+                total_errors += 1
+                total_requests += 1
+
+    end_time = start + duration
+    batch_size = users
+    last_progress = 0
+
+    while time.time() < end_time:
+        # dispara batch de requisições paralelas
+        tasks = [asyncio.create_task(one_request()) for _ in range(batch_size)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        elapsed = time.time() - start
+        pct = min(100, int(elapsed / duration * 100))
+
+        if pct != last_progress:
+            last_progress = pct
+            rps = total_requests / max(elapsed, 0.1)
+            yield sse({
+                "type": "progress",
+                "pct": pct,
+                "elapsed": int(elapsed),
+                "total": duration,
+                "requests": total_requests,
+                "rps": round(rps, 1)
+            })
+
+        if time.time() >= end_time:
+            break
+
+    # métricas finais
+    elapsed = time.time() - start
+    rps = total_requests / max(elapsed, 0.1)
+    latencies.sort()
+
+    def pct_lat(p):
+        if not latencies:
+            return 0
+        idx = int(len(latencies) * p / 100)
+        return round(latencies[min(idx, len(latencies)-1)], 1)
+
+    avg = round(sum(latencies) / len(latencies), 1) if latencies else 0
+    p50 = pct_lat(50)
+    p90 = pct_lat(90)
+    p99 = pct_lat(99)
+
+    # crash probability baseada em p99
+    crash_prob = 0
+    if p99 > 0:
+        if p99 < 500:    crash_prob = 5
+        elif p99 < 1000: crash_prob = 25
+        elif p99 < 2000: crash_prob = 55
+        elif p99 < 5000: crash_prob = 80
+        else:            crash_prob = 95
+
+    # boost se muitos erros 5xx
+    if total_requests > 0 and total_errors / total_requests > 0.1:
+        crash_prob = min(99, crash_prob + 20)
+
+    yield sse({"type": "log", "msg": f"[+] flood completo · {total_requests} req · {round(rps,1)} rps · avg {avg}ms"})
+    yield sse({
+        "type": "result",
+        "metrics": {
+            "total_requests": total_requests,
+            "rps": round(rps, 1),
+            "avg_ms": avg,
+            "p50_ms": p50,
+            "p90_ms": p90,
+            "p99_ms": p99,
+            "errors": total_errors,
+            "duration_s": round(elapsed, 1)
+        },
+        "crash_prob": crash_prob,
+        "raw": f"total={total_requests} rps={round(rps,1)} avg={avg}ms p50={p50}ms p90={p90}ms p99={p99}ms errors={total_errors}"
+    })
     yield sse({"type": "done"})
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "hey": bool(_hey_path())}
-
+    curl_ok = bool(shutil.which("curl"))
+    return {"status": "ok", "hey": False, "curl": curl_ok, "engine": "curl-parallel"}
 
 @app.post("/flood")
 async def flood(req: FloodRequest):
-    """Executa flood real via hey e retorna resultado em SSE streaming."""
     return StreamingResponse(
         _stream_flood(req),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
-
 
 @app.get("/")
 def root():
-    return {"service": "REDFORT API", "version": "1.0.0", "endpoints": ["/flood", "/health"]}
+    return {"service": "REDFORT API", "version": "2.0.0", "engine": "curl-parallel", "endpoints": ["/flood", "/health"]}
